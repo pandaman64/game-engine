@@ -5,8 +5,9 @@ use std::str;
 use std::error::Error;
 use std::mem;
 
-use cgmath::{Matrix, Matrix4, Vector2, Vector3, vec2, vec3};
+use cgmath::{Deg, InnerSpace, Matrix, Matrix4, perspective, Point3, Vector2, Vector3, vec2, vec3};
 use gl::types::*;
+use glfw::{Action, Key, Window, WindowEvent};
 use image::{open, DynamicImage::*, GenericImageView};
 
 #[macro_export]
@@ -42,80 +43,86 @@ impl Drop for DeleteShaderOnDrop {
     }
 }
 
+unsafe fn compile_shader(ty: GLuint, src: &str) -> DeleteShaderOnDrop {
+    let shader = gl::CreateShader(ty);
+    let src = CString::new(src.as_bytes()).unwrap();
+    gl::ShaderSource(shader, 1, &src.as_ptr(), ptr::null());
+    gl::CompileShader(shader);
+
+    let mut success = conv!(gl::FALSE);
+    gl::GetShaderiv(shader, gl::COMPILE_STATUS, &mut success);
+    if success != conv!(gl::TRUE) {
+        let mut info_log = vec![0; 512];
+        gl::GetShaderInfoLog(
+            shader,
+            512,
+            ptr::null_mut(),
+            info_log.as_mut_ptr() as *mut GLchar,
+        );
+        let pos = info_log.iter().position(|&x| x == 0).unwrap();
+        panic!(
+            "failed to compile {} shader: {}",
+            match ty {
+                gl::VERTEX_SHADER => "vertex",
+                gl::GEOMETRY_SHADER => "geometry",
+                gl::FRAGMENT_SHADER => "fragment",
+                _ => "unknown"
+            },
+            CStr::from_bytes_with_nul(&info_log[0..(pos + 1)])
+                .unwrap()
+                .to_string_lossy(),
+        );
+    }
+    DeleteShaderOnDrop(shader)
+}
+
+unsafe fn link_program(shader_program: GLuint) {
+    gl::LinkProgram(shader_program);
+
+    let mut success = conv!(gl::FALSE);
+    gl::GetProgramiv(shader_program, gl::LINK_STATUS, &mut success);
+    if success != gl::TRUE as GLint {
+        let mut info_log = vec![0; 512];
+        gl::GetProgramInfoLog(
+            shader_program,
+            512,
+            ptr::null_mut(),
+            info_log.as_mut_ptr() as *mut GLchar,
+        );
+        let pos = info_log.iter().position(|&x| x == 0).unwrap();
+        panic!(
+            "failed to link program: {}",
+            CStr::from_bytes_with_nul(&info_log[0..(pos + 1)])
+                .unwrap()
+                .to_string_lossy()
+        );
+    }
+}
+
 impl Shader {
     pub unsafe fn from_str(vertex: &str, fragment: &str) -> Self {
-        let vertex_shader = gl::CreateShader(gl::VERTEX_SHADER);
-        let vertex = CString::new(vertex.as_bytes()).unwrap();
-        gl::ShaderSource(vertex_shader, 1, &vertex.as_ptr(), ptr::null());
-        gl::CompileShader(vertex_shader);
-
-        let mut success = gl::FALSE as GLint;
-        gl::GetShaderiv(vertex_shader, gl::COMPILE_STATUS, &mut success);
-        if success != gl::TRUE as GLint {
-            let mut info_log = vec![0; 512];
-            gl::GetShaderInfoLog(
-                vertex_shader,
-                512,
-                ptr::null_mut(),
-                info_log.as_mut_ptr() as *mut GLchar,
-            );
-            let pos = info_log.iter().position(|&x| x == 0).unwrap();
-            panic!(
-                "failed to compile vertex shader: {}",
-                CStr::from_bytes_with_nul(&info_log[0..(pos + 1)])
-                    .unwrap()
-                    .to_string_lossy()
-            );
-        }
-        let _drop_vertex_shader = DeleteShaderOnDrop(vertex_shader);
-
-        let fragment_shader = gl::CreateShader(gl::FRAGMENT_SHADER);
-        let fragment = CString::new(fragment.as_bytes()).unwrap();
-        gl::ShaderSource(fragment_shader, 1, &fragment.as_ptr(), ptr::null());
-        gl::CompileShader(fragment_shader);
-
-        gl::GetShaderiv(fragment_shader, gl::COMPILE_STATUS, &mut success);
-        if success != gl::TRUE as GLint {
-            let mut info_log = vec![0; 512];
-            gl::GetShaderInfoLog(
-                fragment_shader,
-                512,
-                ptr::null_mut(),
-                info_log.as_mut_ptr() as *mut GLchar,
-            );
-            let pos = info_log.iter().position(|&x| x == 0).unwrap();
-            panic!(
-                "failed to compile fragment shader: {}",
-                CStr::from_bytes_with_nul(&info_log[0..(pos + 1)])
-                    .unwrap()
-                    .to_string_lossy()
-            );
-        }
-        let _drop_fragment_shader = DeleteShaderOnDrop(fragment_shader);
+        let vertex_shader = compile_shader(gl::VERTEX_SHADER, vertex);
+        let fragment_shader = compile_shader(gl::FRAGMENT_SHADER, fragment);
 
         let shader_program = gl::CreateProgram();
-        gl::AttachShader(shader_program, vertex_shader);
-        gl::AttachShader(shader_program, fragment_shader);
-        gl::LinkProgram(shader_program);
+        gl::AttachShader(shader_program, vertex_shader.0);
+        gl::AttachShader(shader_program, fragment_shader.0);
+        link_program(shader_program);
 
-        gl::GetProgramiv(shader_program, gl::LINK_STATUS, &mut success);
-        if success != gl::TRUE as GLint {
-            let mut info_log = vec![0; 512];
-            gl::GetProgramInfoLog(
-                shader_program,
-                512,
-                ptr::null_mut(),
-                info_log.as_mut_ptr() as *mut GLchar,
-            );
-            let pos = info_log.iter().position(|&x| x == 0).unwrap();
-            panic!(
-                "failed to link program: {}",
-                CStr::from_bytes_with_nul(&info_log[0..(pos + 1)])
-                    .unwrap()
-                    .to_string_lossy()
-            );
-        }
+        Self { id: shader_program }
+    }
 
+    pub unsafe fn with_geometry_shader(vertex: &str, geometry: &str, fragment: &str) -> Self {
+        let vertex_shader = compile_shader(gl::VERTEX_SHADER, vertex);
+        let geometry_shader = compile_shader(gl::GEOMETRY_SHADER, geometry);
+        let fragment_shader = compile_shader(gl::FRAGMENT_SHADER, fragment);
+
+        let shader_program = gl::CreateProgram();
+        gl::AttachShader(shader_program, vertex_shader.0);
+        gl::AttachShader(shader_program, geometry_shader.0);
+        gl::AttachShader(shader_program, fragment_shader.0);
+        link_program(shader_program);
+        
         Self { id: shader_program }
     }
 
@@ -143,10 +150,131 @@ impl Shader {
         gl::UniformMatrix4fv(self.get_uniform_location(name), 1, gl::FALSE, mat.as_ptr());
     }
 
+    pub unsafe fn set_vec2(&self, name: &CStr, x: f32, y: f32) {
+        gl::Uniform2f(self.get_uniform_location(name), x, y);
+    }
+
     pub unsafe fn set_vec3(&self, name: &CStr, x: f32, y: f32, z: f32) {
         gl::Uniform3f(self.get_uniform_location(name), x, y, z);
     }
+
+    pub unsafe fn bind_uniform_block(&self, name: &CStr, binding_point: GLuint) {
+        let index = gl::GetUniformBlockIndex(self.id, name.as_ptr());
+        gl::UniformBlockBinding(self.id, index, binding_point);
+    }
 }
+
+#[derive(Debug)]
+pub struct FPSCamera {
+    position: Point3<f32>,
+    direction: Vector3<f32>,
+    fov: f32,
+    yaw: f32,
+    pitch: f32,
+    last_x: f32,
+    last_y: f32,
+    ratio: f32,
+    first_mouse: bool,
+}
+
+impl FPSCamera {
+    pub fn new(
+        position: Point3<f32>,
+        direction: Vector3<f32>,
+        fov: f32,
+        yaw: f32,
+        pitch: f32,
+        ratio: f32,
+    ) -> Self {
+        Self {
+            position,
+            direction,
+            fov,
+            yaw,
+            pitch,
+            last_x: 0.0,
+            last_y: 0.0,
+            ratio,
+            first_mouse: true,
+        }
+    }
+
+    pub fn view(&self) -> Matrix4<f32> {
+        let up = vec3(0.0, 1.0, 0.0);
+        Matrix4::look_at_dir(self.position, self.direction, up)
+    }
+
+    pub fn projection(&self) -> Matrix4<f32> {
+        perspective(Deg(self.fov), self.ratio, 0.1, 100.0)
+    }
+
+    pub fn process_event(&mut self, event: &WindowEvent) {
+        match event {
+            WindowEvent::CursorPos(xpos, ypos) => {
+                let xpos = *xpos as f32;
+                let ypos = *ypos as f32;
+
+                if self.first_mouse {
+                    self.first_mouse = false;
+                    self.last_x = xpos;
+                    self.last_y = ypos;
+                    return;
+                }
+                let xoffset = xpos - self.last_x;
+                let yoffset = self.last_y - ypos;
+
+                self.last_x = xpos;
+                self.last_y = ypos;
+
+                const SENSITIVITY: f32 = 0.05;
+                self.yaw += xoffset * SENSITIVITY;
+                self.pitch += yoffset * SENSITIVITY;
+
+                if self.pitch > 89.0 {
+                    self.pitch = 89.0;
+                }
+                if self.pitch < -89.0 {
+                    self.pitch = -89.0;
+                }
+
+                self.direction.x = self.pitch.to_radians().cos() * self.yaw.to_radians().cos();
+                self.direction.y = self.pitch.to_radians().sin();
+                self.direction.z = self.pitch.to_radians().cos() * self.yaw.to_radians().sin();
+                self.direction = self.direction.normalize();
+            }
+            WindowEvent::Scroll(_xoffset, yoffset) => {
+                if self.fov >= 1.0 && self.fov <= 45.0 {
+                    self.fov -= *yoffset as f32;
+                }
+                if self.fov <= 1.0 {
+                    self.fov = 1.0;
+                }
+                if self.fov >= 45.0 {
+                    self.fov = 45.0;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    pub fn process_mouse(&mut self, window: &Window, delta_time: f32) {
+        const SPEED: f32 = 5.0;
+        let up = vec3(0.0, 1.0, 0.0);
+        if window.get_key(Key::W) == Action::Press {
+            self.position += self.direction * SPEED * delta_time;
+        }
+        if window.get_key(Key::S) == Action::Press {
+            self.position -= self.direction * SPEED * delta_time;
+        }
+        if window.get_key(Key::D) == Action::Press {
+            self.position += self.direction.cross(up).normalize() * SPEED * delta_time;
+        }
+        if window.get_key(Key::A) == Action::Press {
+            self.position -= self.direction.cross(up).normalize() * SPEED * delta_time;
+        }
+    }
+}
+
 
 pub unsafe fn load_texture<P: AsRef<Path>>(path: P) -> GLuint {
     let img = open(path).expect("failed to open image file");
@@ -339,7 +467,7 @@ impl Mesh {
         mesh
     }
 
-    pub unsafe fn draw(&self, shader: Shader) {
+    unsafe fn set_texture(&self, shader: Shader) {
         let mut diffuse_num = 0;
         let mut specular_num = 0;
 
@@ -365,11 +493,28 @@ impl Mesh {
 
         // reset active texture: needed?
         gl::ActiveTexture(gl::TEXTURE0);
+    }
+
+    pub unsafe fn draw(&self, shader: Shader) {
+        self.set_texture(shader);
 
         // draw mesh
         gl::BindVertexArray(self.vao);
         gl::DrawElements(gl::TRIANGLES, conv!(self.indices.len()), gl::UNSIGNED_INT, ptr::null());
         gl::BindVertexArray(0);
+    }
+
+    pub unsafe fn draw_instanced(&self, shader: Shader, amount: GLsizei) {
+        self.set_texture(shader);
+
+        // draw mesh
+        gl::BindVertexArray(self.vao);
+        gl::DrawElementsInstanced(gl::TRIANGLES, conv!(self.indices.len()), gl::UNSIGNED_INT, ptr::null(), amount);
+        gl::BindVertexArray(0);
+    }
+
+    pub unsafe fn vao(&self) -> GLuint {
+        self.vao
     }
 }
 
@@ -409,7 +554,6 @@ impl Model {
             if let Some(material_id) = mesh.material_id {
                 let material = &materials[material_id];
 
-                // TODO: prevent loading texture multiple times
                 if !material.diffuse_texture.is_empty() {
                     let tex_name = name.with_file_name(&material.diffuse_texture);
 
@@ -449,5 +593,9 @@ impl Model {
         for mesh in self.meshes.iter() {
             mesh.draw(shader);
         }
+    }
+
+    pub fn meshes(&self) -> &[Mesh] {
+        &self.meshes
     }
 }
